@@ -18,6 +18,7 @@ import random
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import llm_tool
+from astrbot.api import AstrBotConfig
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +45,11 @@ class StickerMaster(Star):
             └── *.json       ← 可以放多个包，自动合并加载
     """
 
-    def __init__(self, context: Context, config: dict):
-        super().__init__(context, config)
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        if not isinstance(self.config, dict):
+            self.config = {}
         self.sticker_map: dict[str, str] = {}   # meaning → url
         self.meanings_list: list[str] = []       # 给 difflib 用
         self._reload()
