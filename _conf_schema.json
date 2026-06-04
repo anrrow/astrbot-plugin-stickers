@@ -1,0 +1,9 @@
+[
+  {
+    "key": "sticker_probability",
+    "type": "float",
+    "description": "AI 发表情包的概率",
+    "hint": "0 = 从不发，1 = 每次都发。建议 0.3~0.6，真人感最强",
+    "default": 0.4
+  }
+]
