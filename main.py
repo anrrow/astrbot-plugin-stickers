@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ── 发送概率 ──────────────────────────────────────────────────────────────────
 # 0.0 = 永不发   1.0 = 每次都发   建议区间：0.75 ~ 1.0
 # 改这里就够了，不需要动其他任何地方
-STICKER_PROBABILITY: float = 0.85
+STICKER_PROBABILITY: float = 0.95
 
 
 @register(
