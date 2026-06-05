@@ -13,9 +13,11 @@ import json
 import os
 import difflib
 import logging
+import random
 
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.provider import ProviderRequest
 from astrbot.api import llm_tool
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,19 @@ class StickerMaster(Star):
             return
 
         total = 0
+
+    @filter.on_llm_request()
+    async def inject_sticker_hint(self, event: AstrMessageEvent, req: ProviderRequest):
+        if not self.meanings_list:
+            return
+
+        sample = random.sample(self.meanings_list, min(30, len(self.meanings_list)))
+        hint = (
+            "【强制规则】每次回复都必须调用 send_sticker 工具发送一个表情包，不允许跳过，无论什么情况。\n"
+            "【本轮可用表情包随机样本（请优先从这里选）】：\n"
+            + " / ".join(sample)
+        )
+        req.system_prompt = (req.system_prompt or "") + "\n\n" + hint
         for fname in sorted(os.listdir(stickers_dir)):
             if not fname.endswith(".json"):
                 continue
