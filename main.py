@@ -1,24 +1,27 @@
 """
 sticker_master — AstrBot 表情包 AI 工具插件
 ============================================
-核心理念：LLM Tool Use + 语境门控 + 软兜底 + 角色专属表情包。
+核心理念：LLM Tool Use + 语境门控 + 软兜底 + 人格专属表情包。
 
 本版修复/增强：
-1. /sticker_add 支持多行「含义 URL」粘贴，也支持「(角色名) 含义 URL」。
+1. /sticker_add 支持多行「含义 URL」粘贴，也支持「(人格分组名) 含义 URL」。
 2. 增加 /sticker_import，语义同 /sticker_add，更适合批量粘贴 URL。
 3. /sticker_list_custom 不再让人误会：会提示 custom.json 与 default.json 的区别。
-4. 增加角色专属表情包：/sticker_role 萌猫 后，本会话优先/限定使用萌猫表情包。
-5. LLM 工具 send_sticker 会按当前会话角色匹配，不再把不同角色同名 meaning 覆盖掉。
+4. 增加人格专属表情包：/sticker_role 萌猫 后，本会话优先/限定使用萌猫表情包。
+5. LLM 工具 send_sticker 会按当前匹配人格分组匹配，不再把不同角色同名 meaning 覆盖掉。
 6. 增加原始消息监听兜底：QQ 多行 /sticker_add 被命令解析器吞掉时，也能直接导入。
+7. 增加 WebUI 配置面板粘贴栏：别人安装插件后可直接在插件配置中粘贴自己的表情包，不需要改 GitHub。
+8. 增加人格分组面板：每个角色一个折叠项，人格分组名 + URL 粘贴栏，便于区分谁是谁。
 
 作者：Anrrow
-版本：1.5.1-raw-multiline
+版本：1.7.0-persona-pack
 """
 
 import json
 import os
 import difflib
 import logging
+import inspect
 import random
 import re
 import time
@@ -52,7 +55,7 @@ ROLE_PREFIX_RE = re.compile(r"^\s*[（(]([^()（）]{1,40})[）)]\s*(.*?)\s*$")
     "sticker_master",
     "Anrrow",
     "AI 驱动表情包工具 - 让 AI 像真人一样主动发送表情包",
-    "1.5.0-role-url",
+    "1.7.0-persona-pack",
 )
 class StickerMaster(Star):
     """
@@ -60,7 +63,7 @@ class StickerMaster(Star):
 
     表情包 JSON 支持两种格式：
     1. 普通：{"meaning":"开心", "url":"https://..."}
-    2. 角色专属：{"role":"萌猫", "meaning":"哭哭", "url":"https://..."}
+    2. 人格专属：{"role":"萌猫", "meaning":"哭哭", "url":"https://..."}
 
     也支持把 role 写在 meaning 开头：
       {"meaning":"(萌猫) 哭哭", "url":"https://..."}
@@ -70,9 +73,9 @@ class StickerMaster(Star):
       (萌猫) 卧槽尼玛理理我啊 https://files.catbox.moe/a2erwr.jpeg
       小狗哭哭 https://files.catbox.moe/outz25.gif
 
-    角色命令：
+    人格调试命令：
       /sticker_role 萌猫     # 当前会话启用萌猫专属表情包
-      /sticker_role off      # 关闭当前会话角色限定
+      /sticker_role off      # 关闭当前匹配人格分组限定
       /sticker_roles         # 查看有哪些角色
     """
 
@@ -84,7 +87,7 @@ class StickerMaster(Star):
         self.sticker_map: dict[str, str] = {}
         self.meanings_list: list[str] = []
 
-        # 匹配用表：普通表情与角色专属表情分开，避免「哭哭」被不同角色互相覆盖。
+        # 匹配用表：普通表情与人格专属表情分开，避免「哭哭」被不同角色互相覆盖。
         self.common_map: dict[str, str] = {}
         self.role_sticker_map: dict[str, dict[str, str]] = {}
 
@@ -97,11 +100,26 @@ class StickerMaster(Star):
         self.aggressive_score = self._cfg_int("sticker_aggressive_score", 4, 2, 10)
         self.debug = self._cfg_bool("sticker_debug", False)
 
-        # 角色相关配置。
-        # sticker_default_role：默认角色名。留空则不限定。
-        # sticker_role_strict：开启后，设置了角色的会话只会用该角色 + 通用表情；关闭则匹配不到时可回退到全库。
+        # 人格相关配置。
+        # sticker_auto_persona_enabled：开启后，自动读取当前会话正在使用的 AstrBot 人格。
+        # sticker_default_role：兜底人格/表情包分组名。留空则不限定。
+        # sticker_role_strict：开启后，当前人格只用该人格专属 + 通用表情；关闭则匹配不到时可回退到全库。
+        self.auto_persona_enabled = self._cfg_bool("sticker_auto_persona_enabled", True)
         self.default_role = str(self._cfg("sticker_default_role", "") or "").strip()
         self.role_strict = self._cfg_bool("sticker_role_strict", True)
+        self.persona_alias_map: dict[str, str] = {}
+        self.session_persona_cache: dict[str, str] = {}
+        self.session_persona_debug: dict[str, str] = {}
+
+        # WebUI 配置面板导入区：
+        # 1) sticker_config_text：一个大粘贴栏，支持通用与 (角色) 前缀。
+        # 2) sticker_role_groups：人格分组面板，每个角色一个 role_name + stickers_text。
+        # 这些内容保存在 AstrBot 的 data/config/<plugin>_config.json，不写进 GitHub。
+        self.config_sticker_text = str(self._cfg("sticker_config_text", "") or "")
+        self.config_persona_groups = self._cfg("sticker_persona_groups", []) or []
+        self.config_role_groups = self._cfg("sticker_role_groups", []) or []  # 兼容旧配置
+        self._last_config_fail_list: list[tuple[str, str]] = []
+
         self.session_roles: dict[str, str] = {}
 
         # 用于判断“这一轮是不是 LLM 回复”、避免重复补发，以及控制兜底频率。
@@ -148,6 +166,23 @@ class StickerMaster(Star):
         except Exception:
             value = default
         return max(min_v, min(max_v, value))
+
+    async def _maybe_await(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    def _norm_key(self, value: str) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"[\s\-＿_·•:：,，。.!！?？()（）\[\]【】]+", "", text)
+        return text
+
+    def _register_persona_alias(self, alias: str, pack_name: str) -> None:
+        alias = str(alias or "").strip()
+        pack_name = str(pack_name or "").strip()
+        if not alias or not pack_name:
+            return
+        self.persona_alias_map[self._norm_key(alias)] = pack_name
 
     # ═══════════════════════════════════════════════════════════
     # 数据加载
@@ -207,6 +242,7 @@ class StickerMaster(Star):
         self.sticker_map.clear()
         self.common_map.clear()
         self.role_sticker_map.clear()
+        self.persona_alias_map.clear()
 
         stickers_dir = self._stickers_dir()
         if not os.path.exists(stickers_dir):
@@ -237,11 +273,18 @@ class StickerMaster(Star):
             except Exception as e:
                 logger.error(f"[StickerMaster] 加载 {fname} 失败: {e}")
 
+        config_total, config_fail = self._load_config_stickers()
+        self._last_config_fail_list = config_fail
+        total += config_total
+
         self.meanings_list = list(self.sticker_map.keys())
         logger.info(
             f"[StickerMaster] ✅ 就绪，共 {total} 个表情包，"
+            f"其中配置面板 {config_total} 个，"
             f"角色 {len(self.role_sticker_map)} 个，通用 {len(self.common_map)} 个"
         )
+        if config_fail:
+            logger.warning(f"[StickerMaster] 配置面板有 {len(config_fail)} 条未解析")
 
     def _read_sticker_json(self, fpath: str) -> list[dict]:
         """兼容 list 格式，也兼容 {stickers:[...]} / {分类:[...]} 格式。"""
@@ -263,31 +306,256 @@ class StickerMaster(Star):
 
         return []
 
+    def _maybe_role_section(self, line: str) -> str:
+        """识别配置面板中的角色分段标题。
+
+        支持：
+          [萌猫]
+          【萌猫】
+          # 萌猫
+          # 角色：萌猫
+          角色：萌猫
+          role: 萌猫
+          [通用] / # 通用 / common 会切回通用表情。
+        """
+        t = (line or "").strip()
+        if not t:
+            return ""
+
+        m = re.match(r"^[\[【]\s*([^\]】]{1,40})\s*[\]】]$", t)
+        if m:
+            role = m.group(1).strip()
+            return "" if role.lower() in {"通用", "common", "global", "default", "none"} else role
+
+        if t.startswith("#"):
+            t = t.lstrip("#").strip()
+            if not t:
+                return "__comment__"
+
+        m = re.match(r"^(?:角色|role|char|character)\s*[:：]\s*(.{1,40})$", t, re.I)
+        if m:
+            role = m.group(1).strip()
+            return "" if role.lower() in {"通用", "common", "global", "default", "none"} else role
+
+        if t.lower() in {"通用", "common", "global", "default", "none"}:
+            return ""
+
+        return "__not_section__"
+
+    def _parse_sticker_text_block(
+        self,
+        body: str,
+        default_role: str = "",
+    ) -> tuple[list[tuple[str, str, str]], list[tuple[str, str]]]:
+        """解析 WebUI 粘贴栏，并支持角色分段。"""
+        ok_list: list[tuple[str, str, str]] = []
+        fail_list: list[tuple[str, str]] = []
+        current_role = (default_role or "").strip()
+
+        for raw_line in (body or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("//"):
+                continue
+
+            if not URL_RE.search(line):
+                section = self._maybe_role_section(line)
+                if section == "__comment__":
+                    continue
+                if section != "__not_section__":
+                    current_role = section
+                    continue
+                continue
+
+            match = URL_RE.search(line)
+            if not match:
+                continue
+
+            url = match.group(0).strip().rstrip("，,。)")
+            meaning_part = line[:match.start()].strip() or line[match.end():].strip()
+            if not meaning_part:
+                fail_list.append((line, "缺少含义；格式应为：含义 URL"))
+                continue
+
+            prefix_role, meaning = self._split_role_prefix(meaning_part)
+            role = prefix_role or current_role
+            if not meaning:
+                fail_list.append((line, "含义为空"))
+                continue
+
+            ok_list.append((role, meaning, url))
+
+        return ok_list, fail_list
+
+    def _load_config_stickers(self) -> tuple[int, list[tuple[str, str]]]:
+        """从 WebUI 配置面板读取表情包，不写 custom.json。"""
+        ok_all: list[tuple[str, str, str]] = []
+        fail_all: list[tuple[str, str]] = []
+
+        ok, fail = self._parse_sticker_text_block(self.config_sticker_text)
+        ok_all.extend(ok)
+        fail_all.extend(fail)
+
+        group_sources: list[Any] = []
+        if isinstance(self.config_persona_groups, list):
+            group_sources.extend(self.config_persona_groups)
+        if isinstance(self.config_role_groups, list):
+            group_sources.extend(self.config_role_groups)
+
+        for group in group_sources:
+            if not isinstance(group, dict):
+                continue
+            role_name = str(
+                group.get("persona_name")
+                or group.get("role_name")
+                or group.get("role")
+                or group.get("人格名")
+                or group.get("人格分组名")
+                or ""
+            ).strip()
+            aliases_raw = str(
+                group.get("persona_aliases")
+                or group.get("aliases")
+                or group.get("别名")
+                or ""
+            )
+            text = str(group.get("stickers_text") or group.get("text") or group.get("表情包") or "")
+            if not role_name and not text.strip():
+                continue
+            if role_name:
+                self._register_persona_alias(role_name, role_name)
+                for alias in re.split(r"[,，;；\n]+", aliases_raw):
+                    self._register_persona_alias(alias, role_name)
+            ok, fail = self._parse_sticker_text_block(text, default_role=role_name)
+            ok_all.extend(ok)
+            fail_all.extend(fail)
+
+        for role, meaning, url in ok_all:
+            self._put_sticker(role, meaning, url)
+
+        return len(ok_all), fail_all
+
     # ═══════════════════════════════════════════════════════════
-    # 角色状态
+    # 人格状态：自动把当前 AstrBot 人格映射到表情包分组
     # ═══════════════════════════════════════════════════════════
 
     def _current_role(self, event: AstrMessageEvent | None = None) -> str:
+        """同步兜底：优先手动覆盖，其次使用最近一次自动识别缓存，再其次默认分组。"""
         if event is not None:
-            session_role = self.session_roles.get(self._session_key(event), "")
+            session_key = self._session_key(event)
+            session_role = self.session_roles.get(session_key, "")
             if session_role:
                 return session_role
+            cached = self.session_persona_cache.get(session_key, "")
+            if cached:
+                return cached
         return self.default_role
 
-    def _available_meanings(self, event: AstrMessageEvent | None = None) -> list[str]:
-        """给模型看的 meaning 样例。设置角色后，优先给该角色 + 通用。"""
-        role = self._current_role(event)
+    def _match_persona_to_pack(self, candidates: list[str]) -> str:
+        """把 AstrBot 人格名/persona_id 映射到表情包分组名。"""
+        if not candidates:
+            return ""
+        for cand in candidates:
+            nk = self._norm_key(cand)
+            if nk and nk in self.persona_alias_map:
+                return self.persona_alias_map[nk]
+        role_keys = {self._norm_key(role): role for role in self.role_sticker_map.keys()}
+        for cand in candidates:
+            nk = self._norm_key(cand)
+            if nk and nk in role_keys:
+                return role_keys[nk]
+        for cand in candidates:
+            nk = self._norm_key(cand)
+            if not nk:
+                continue
+            for role_nk, role in role_keys.items():
+                if role_nk and (role_nk in nk or nk in role_nk):
+                    return role
+        return ""
+
+    async def _detect_persona_candidates(self, event: AstrMessageEvent | None) -> list[str]:
+        """尽量从 AstrBot 当前会话读取人格名/persona_id。失败时返回空列表，不影响插件运行。"""
+        if event is None:
+            return []
+        candidates: list[str] = []
+        umo = getattr(event, "unified_msg_origin", None) or getattr(event, "session_id", None)
+        def add(value: Any):
+            if value is None:
+                return
+            if isinstance(value, str):
+                v = value.strip()
+                if v and v not in candidates:
+                    candidates.append(v)
+                return
+            if isinstance(value, dict):
+                for k in ("name", "persona_id", "id", "display_name", "title"):
+                    add(value.get(k))
+                return
+            for attr in ("name", "persona_id", "id", "display_name", "title"):
+                try:
+                    add(getattr(value, attr, None))
+                except Exception:
+                    pass
+        try:
+            conv_mgr = getattr(self.context, "conversation_manager", None)
+            if conv_mgr is not None and umo:
+                cid = await self._maybe_await(conv_mgr.get_curr_conversation_id(umo))
+                if cid:
+                    conv = await self._maybe_await(conv_mgr.get_conversation(umo, cid))
+                    add(conv)
+                    persona_id = getattr(conv, "persona_id", None) if conv is not None else None
+                    if persona_id:
+                        add(persona_id)
+                        persona_mgr = getattr(self.context, "persona_manager", None)
+                        if persona_mgr is not None and hasattr(persona_mgr, "get_persona"):
+                            try:
+                                add(await self._maybe_await(persona_mgr.get_persona(persona_id)))
+                            except Exception:
+                                pass
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"[StickerMaster] 读取 conversation persona 失败: {e}")
+        try:
+            persona_mgr = getattr(self.context, "persona_manager", None)
+            if persona_mgr is not None and hasattr(persona_mgr, "get_default_persona_v3"):
+                add(await self._maybe_await(persona_mgr.get_default_persona_v3(umo)))
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"[StickerMaster] 读取 default persona 失败: {e}")
+        return candidates
+
+    async def _resolve_current_role(self, event: AstrMessageEvent | None = None) -> str:
+        if event is None:
+            return self.default_role
+        session_key = self._session_key(event)
+        manual = self.session_roles.get(session_key, "")
+        if manual:
+            return manual
+        if self.auto_persona_enabled:
+            candidates = await self._detect_persona_candidates(event)
+            matched = self._match_persona_to_pack(candidates)
+            self.session_persona_debug[session_key] = ", ".join(candidates) if candidates else "未读取到"
+            if matched:
+                self.session_persona_cache[session_key] = matched
+                return matched
+            self.session_persona_cache.pop(session_key, None)
+        return self.default_role
+
+    def _available_meanings_for_role(self, role: str = "") -> list[str]:
+        """给模型看的 meaning 样例。检测到人格后，优先给该人格 + 通用。"""
+        role = (role or "").strip()
         if not role:
             return self.meanings_list[:]
-
         role_items = [self._display_meaning(m, role) for m in self.role_sticker_map.get(role, {}).keys()]
         common_items = list(self.common_map.keys())
         if self.role_strict:
             return role_items + common_items
-
-        # 不严格时，把当前角色放前面，其他角色也作为兜底样例。
         other = [m for m in self.meanings_list if m not in set(role_items + common_items)]
         return role_items + common_items + other
+
+    async def _available_meanings(self, event: AstrMessageEvent | None = None) -> list[str]:
+        return self._available_meanings_for_role(await self._resolve_current_role(event))
 
     # ═══════════════════════════════════════════════════════════
     # LLM 请求注入：让模型更愿意调用工具
@@ -301,16 +569,16 @@ class StickerMaster(Star):
         self._touch_recent(self._recent_llm_event_keys, self._event_key(event))
         self._cleanup_recent()
 
-        pool = self._available_meanings(event)
+        current_role = await self._resolve_current_role(event)
+        pool = self._available_meanings_for_role(current_role)
         if not pool:
             return
         sample = random.sample(pool, min(self.sticker_sample_size, len(pool)))
-        current_role = self._current_role(event)
         role_line = ""
         if current_role:
             role_line = (
-                f"当前会话表情包角色是「{current_role}」。"
-                "调用 send_sticker 时优先选择这个角色的 meaning；不要混用其他角色专属表情包。\n"
+                f"当前 AstrBot 人格已匹配到表情包分组「{current_role}」。"
+                "调用 send_sticker 时优先选择这个人格分组的 meaning；不要混用其他人格专属表情包。\n"
             )
 
         hint = (
@@ -418,7 +686,7 @@ class StickerMaster(Star):
                     )
                 return
 
-            role = self._current_role(event)
+            role = await self._resolve_current_role(event)
             meaning = self._guess_meaning(visible_text, role=role)
             url, matched = self._match(meaning, role=role)
             if not url:
@@ -684,7 +952,7 @@ class StickerMaster(Star):
             return (
                 "用法（单条）：\n"
                 "  /sticker_add 含义 直连图片URL\n\n"
-                "用法（角色专属）：\n"
+                "用法（人格专属）：\n"
                 "  /sticker_add (萌猫) 哭哭 https://xxx.gif\n\n"
                 "用法（批量，每行一条）：\n"
                 "  /sticker_add\n"
@@ -732,7 +1000,7 @@ class StickerMaster(Star):
         role_count = sum(1 for role, _, _ in ok_list if role)
         lines = [
             f"✅ 完成！新增 {added} 个，更新 {updated} 个，当前共 {len(self.sticker_map)} 个",
-            f"  其中本次角色专属：{role_count} 个；通用：{len(ok_list) - role_count} 个",
+            f"  其中本次人格专属：{role_count} 个；通用：{len(ok_list) - role_count} 个",
         ]
         if fail_list:
             lines.append(f"\n⚠️ 以下 {len(fail_list)} 条跳过：")
@@ -751,7 +1019,7 @@ class StickerMaster(Star):
 
         Args:
             meaning(string): 想表达的情绪或场景。优先填表情包库中已有的 meaning。
-                如果当前会话设置了角色表情包，也可以传「(角色名) 含义」。
+                如果当前会话设置了角色表情包，也可以传「(人格分组名) 含义」。
         """
         user_text = (getattr(event, "message_str", "") or "").strip()
         if not self._context_allows_sticker(user_text):
@@ -759,7 +1027,7 @@ class StickerMaster(Star):
             return
 
         session_key = self._session_key(event)
-        role = self._current_role(event)
+        role = await self._resolve_current_role(event)
 
         url, matched = self._match(meaning, role=role)
         if not url:
@@ -1023,7 +1291,7 @@ class StickerMaster(Star):
             yield event.plain_result("用法：/sticker_search 关键词\n例：/sticker_search 思念")
             return
 
-        pool = self._available_meanings(event)
+        pool = await self._available_meanings(event)
         results = [m for m in pool if keyword in m]
         if not results:
             results = difflib.get_close_matches(keyword, pool, n=8, cutoff=0.2)
@@ -1041,17 +1309,17 @@ class StickerMaster(Star):
 
     @filter.command("sticker_roles")
     async def cmd_roles(self, event: AstrMessageEvent):
-        """查看可用角色表情包。"""
+        """查看可用人格表情包分组。"""
         if not self.role_sticker_map:
-            yield event.plain_result("📭 当前还没有角色专属表情包。添加格式：/sticker_import\n(萌猫) 哭哭 https://xxx.gif")
+            yield event.plain_result("📭 当前还没有人格专属表情包。添加格式：/sticker_import\n(萌猫) 哭哭 https://xxx.gif")
             return
 
-        lines = ["🎭 当前可用角色表情包："]
+        lines = ["🎭 当前可用人格表情包分组："]
         for role, mp in sorted(self.role_sticker_map.items(), key=lambda x: x[0]):
             lines.append(f"  • {role}：{len(mp)} 个")
-        current = self._current_role(event)
-        lines.append(f"\n当前会话角色：{current or '未设置'}")
-        lines.append("设置：/sticker_role 角色名；关闭：/sticker_role off")
+        current = await self._resolve_current_role(event)
+        lines.append(f"\n当前匹配人格分组：{current or '未匹配'}")
+        lines.append("正常不需要手动设置；调试覆盖：/sticker_role 分组名；关闭覆盖：/sticker_role off")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("sticker_role")
@@ -1062,10 +1330,12 @@ class StickerMaster(Star):
         session_key = self._session_key(event)
 
         if not role:
-            current = self._current_role(event)
+            current = await self._resolve_current_role(event)
+            detected = self.session_persona_debug.get(session_key, "未检测")
             yield event.plain_result(
-                f"当前会话表情包角色：{current or '未设置'}\n"
-                "设置：/sticker_role 萌猫\n关闭：/sticker_role off\n查看角色：/sticker_roles"
+                f"当前匹配人格分组：{current or '未匹配'}\n"
+                f"检测到的人格候选：{detected}\n"
+                "正常会自动跟随 AstrBot 当前人格；仅调试时用 /sticker_role 分组名 手动覆盖；关闭覆盖：/sticker_role off"
             )
             return
 
@@ -1077,10 +1347,10 @@ class StickerMaster(Star):
         self.session_roles[session_key] = role
         count = len(self.role_sticker_map.get(role, {}))
         if count:
-            yield event.plain_result(f"✅ 当前会话已设置为「{role}」专属表情包，共 {count} 个")
+            yield event.plain_result(f"✅ 当前会话已手动覆盖为「{role}」专属表情包，共 {count} 个")
         else:
             yield event.plain_result(
-                f"⚠️ 当前会话已设置为「{role}」，但库里还没有这个角色的表情包。\n"
+                f"⚠️ 当前会话已手动覆盖为「{role}」，但库里还没有这个角色的表情包。\n"
                 f"添加格式：/sticker_import\n({role}) 哭哭 https://xxx.gif"
             )
 
@@ -1089,13 +1359,79 @@ class StickerMaster(Star):
         """查看 custom.json 实际保存路径，排查装错目录/权限问题。"""
         p = self._custom_path()
         exists = os.path.exists(p)
-        count = len(self._load_custom())
+        custom_count = len(self._load_custom())
+        panel_ok, panel_fail = self._parse_sticker_text_block(self.config_sticker_text)
+        group_sources: list[Any] = []
+        if isinstance(self.config_persona_groups, list):
+            group_sources.extend(self.config_persona_groups)
+        if isinstance(self.config_role_groups, list):
+            group_sources.extend(self.config_role_groups)
+        for group in group_sources:
+            if not isinstance(group, dict):
+                continue
+            role_name = str(group.get("persona_name") or group.get("role_name") or group.get("role") or "").strip()
+            text = str(group.get("stickers_text") or group.get("text") or "")
+            ok, fail = self._parse_sticker_text_block(text, default_role=role_name)
+            panel_ok.extend(ok)
+            panel_fail.extend(fail)
         yield event.plain_result(
             "📁 表情包保存路径\n"
             f"custom.json：{p}\n"
             f"是否存在：{'是' if exists else '否'}\n"
-            f"自定义条目：{count} 个"
+            f"QQ命令自定义条目：{custom_count} 个\n"
+            f"配置面板条目：{len(panel_ok)} 个\n"
+            f"配置面板未解析：{len(panel_fail)} 条\n"
+            f"当前总可用：{len(self.sticker_map)} 个"
         )
+
+    @filter.command("sticker_config_check")
+    async def cmd_config_check(self, event: AstrMessageEvent):
+        """检查 WebUI 配置面板粘贴栏是否解析成功。"""
+        panel_ok, panel_fail = self._parse_sticker_text_block(self.config_sticker_text)
+        group_sources: list[Any] = []
+        if isinstance(self.config_persona_groups, list):
+            group_sources.extend(self.config_persona_groups)
+        if isinstance(self.config_role_groups, list):
+            group_sources.extend(self.config_role_groups)
+        for group in group_sources:
+            if not isinstance(group, dict):
+                continue
+            role_name = str(group.get("persona_name") or group.get("role_name") or group.get("role") or "").strip()
+            text = str(group.get("stickers_text") or group.get("text") or "")
+            ok, fail = self._parse_sticker_text_block(text, default_role=role_name)
+            panel_ok.extend(ok)
+            panel_fail.extend(fail)
+
+        lines = [
+            f"✅ 配置面板可解析：{len(panel_ok)} 条",
+            f"⚠️ 配置面板未解析：{len(panel_fail)} 条",
+        ]
+        if panel_ok:
+            lines.append("\n示例前 10 条：")
+            lines.append(self._format_items(panel_ok, limit=10))
+        if panel_fail:
+            lines.append("\n失败前 10 条：")
+            for t, r in panel_fail[:10]:
+                lines.append(f"  ✗ {t}  ←  {r}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("sticker_persona_check")
+    async def cmd_persona_check(self, event: AstrMessageEvent):
+        """检查当前 AstrBot 人格是否能匹配到表情包分组。"""
+        candidates = await self._detect_persona_candidates(event)
+        matched = await self._resolve_current_role(event)
+        alias_count = len(self.persona_alias_map)
+        lines = [
+            "🧩 人格表情包匹配检查",
+            f"自动跟随人格：{'开启' if self.auto_persona_enabled else '关闭'}",
+            f"AstrBot 人格候选：{', '.join(candidates) if candidates else '未读取到'}",
+            f"匹配到的表情包分组：{matched or '未匹配'}",
+            f"可用人格分组：{', '.join(sorted(self.role_sticker_map.keys())) if self.role_sticker_map else '暂无'}",
+            f"别名数量：{alias_count}",
+        ]
+        if not matched and self.role_sticker_map:
+            lines.append("\n如果没匹配上：在插件配置的人格分组里，把『人格名/人格ID』写成 AstrBot WebUI 里的人格名称，或把实际候选填到『人格别名』里。")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("sticker_stats")
     async def cmd_stats(self, event: AstrMessageEvent):
@@ -1105,28 +1441,28 @@ class StickerMaster(Star):
             yield event.plain_result("❌ 暂未加载任何表情包，请把 JSON 放入 stickers/ 目录，或用 /sticker_import 添加")
             return
 
-        current_role = self._current_role(event)
+        current_role = await self._resolve_current_role(event)
         role_lines = []
         for role, mp in sorted(self.role_sticker_map.items(), key=lambda x: x[0]):
             role_lines.append(f"  • {role}：{len(mp)} 个")
         if not role_lines:
-            role_lines.append("  • 暂无角色专属")
+            role_lines.append("  • 暂无人格专属")
 
-        examples = self._available_meanings(event)[:5]
+        examples = (await self._available_meanings(event))[:5]
         yield event.plain_result(
             f"📦 表情包统计\n"
             f"  总数：{len(self.sticker_map)} 个\n"
             f"  其中 custom.json：{custom_count} 个\n"
             f"  通用：{len(self.common_map)} 个\n"
-            f"  角色数：{len(self.role_sticker_map)} 个\n"
-            f"  当前会话角色：{current_role or '未设置'}\n"
-            f"  角色严格模式：{'开启' if self.role_strict else '关闭'}\n"
+            f"  人格分组数：{len(self.role_sticker_map)} 个\n"
+            f"  当前匹配人格分组：{current_role or '未设置'}\n"
+            f"  人格严格模式：{'开启' if self.role_strict else '关闭'}\n"
             f"  软兜底：{'开启' if self.fallback_enabled else '关闭'}\n"
             f"  兜底概率：{self.sticker_probability}\n"
             f"  兜底冷却：{self.cooldown_seconds} 秒\n"
             f"  候选分数：{self.min_score}\n"
             f"  连续未发轻推：{self.nudge_after_turns} 轮\n"
             f"  强情绪分数：{self.aggressive_score}\n"
-            f"\n角色明细：\n" + "\n".join(role_lines[:20]) +
+            f"\n人格分组明细：\n" + "\n".join(role_lines[:20]) +
             f"\n\n示例（前5个）：\n" + "\n".join(f"  • {m}" for m in examples)
         )

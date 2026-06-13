@@ -1,1 +1,135 @@
-[]
+{
+  "sticker_config_text": {
+    "description": "通用补充表情包粘贴栏",
+    "type": "text",
+    "default": "",
+    "hint": "每行一条：含义 URL。这里填的是全人格通用的补充表情包；插件自带 stickers/default.json 也是通用表情包。保存配置后请重启插件或发送 /sticker_reload。",
+    "editor_mode": true,
+    "editor_language": "plaintext"
+  },
+  "sticker_persona_groups": {
+    "description": "人格专属表情包分组（推荐）",
+    "type": "template_list",
+    "default": [],
+    "templates": {
+      "persona_pack": {
+        "name": "人格表情包",
+        "hint": "一个 AstrBot 人格一个分组。插件会自动读取当前会话正在使用的人格，并优先使用对应分组里的表情包。",
+        "display_item": "persona_name",
+        "hide_hint_in_list": true,
+        "items": {
+          "persona_name": {
+            "description": "人格名 / 人格ID",
+            "type": "string",
+            "default": "",
+            "hint": "必须尽量和 AstrBot WebUI 里的人格名称或 persona_id 一致，例如：季野、黎珩、萌猫。"
+          },
+          "persona_aliases": {
+            "description": "人格别名（可选）",
+            "type": "text",
+            "default": "",
+            "hint": "如果 /sticker_persona_check 里显示的人格候选和上面的名字不完全一致，就把候选名粘到这里。支持一行一个，或用逗号分隔。",
+            "editor_mode": true,
+            "editor_language": "plaintext"
+          },
+          "stickers_text": {
+            "description": "该人格的专属表情包粘贴栏",
+            "type": "text",
+            "default": "",
+            "hint": "每行一条：含义 URL。例如：哭哭 https://xxx.gif。这里不需要每行再写人格名。",
+            "editor_mode": true,
+            "editor_language": "plaintext"
+          }
+        }
+      }
+    }
+  },
+  "sticker_role_groups": {
+    "description": "兼容旧字段：角色/人格表情包分组",
+    "type": "template_list",
+    "default": [],
+    "templates": {
+      "role_pack": {
+        "name": "旧版分组",
+        "hint": "为了兼容旧配置保留。新用户建议使用上面的『人格专属表情包分组』。",
+        "display_item": "role_name",
+        "hide_hint_in_list": true,
+        "items": {
+          "role_name": {
+            "description": "旧版分组名",
+            "type": "string",
+            "default": ""
+          },
+          "stickers_text": {
+            "description": "旧版粘贴栏",
+            "type": "text",
+            "default": "",
+            "editor_mode": true,
+            "editor_language": "plaintext"
+          }
+        }
+      }
+    }
+  },
+  "sticker_auto_persona_enabled": {
+    "description": "自动跟随 AstrBot 当前人格",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，插件会读取当前会话的人格名/persona_id，并自动选择同名表情包分组。"
+  },
+  "sticker_default_role": {
+    "description": "兜底人格分组名",
+    "type": "string",
+    "default": "",
+    "hint": "留空表示没有匹配到人格分组时只使用通用表情包。填写后，未匹配时会使用这个分组。"
+  },
+  "sticker_role_strict": {
+    "description": "人格严格模式",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，当前人格只使用该人格专属 + 通用表情；关闭后，匹配不到时允许回退到其他人格分组。"
+  },
+  "sticker_probability": {
+    "description": "兜底发表情概率",
+    "type": "float",
+    "default": 0.65,
+    "hint": "AI 没主动调用工具时，插件根据语境自动兜底发表情的概率，0 到 1。"
+  },
+  "sticker_sample_size": {
+    "description": "注入给模型的候选表情数量",
+    "type": "int",
+    "default": 50,
+    "hint": "不要太大，太大会污染上下文。"
+  },
+  "sticker_fallback_enabled": {
+    "description": "启用自动兜底发表情",
+    "type": "bool",
+    "default": true
+  },
+  "sticker_cooldown_seconds": {
+    "description": "发表情冷却秒数",
+    "type": "int",
+    "default": 45,
+    "hint": "同一个会话多久内不重复发。填 0 表示无冷却。"
+  },
+  "sticker_min_score": {
+    "description": "兜底最低触发分数",
+    "type": "int",
+    "default": 2
+  },
+  "sticker_nudge_after_turns": {
+    "description": "连续未发表情几轮后提高触发倾向",
+    "type": "int",
+    "default": 2
+  },
+  "sticker_aggressive_score": {
+    "description": "强触发分数",
+    "type": "int",
+    "default": 4
+  },
+  "sticker_debug": {
+    "description": "调试日志",
+    "type": "bool",
+    "default": false
+  }
+}
