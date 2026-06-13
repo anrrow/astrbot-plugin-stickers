@@ -14,7 +14,7 @@ sticker_master — AstrBot 表情包 AI 工具插件
 8. 增加人格分组面板：每个角色一个折叠项，人格分组名 + URL 粘贴栏，便于区分谁是谁。
 
 作者：Anrrow
-版本：1.7.1-persona-network-fix
+版本：1.7.2-history-safe
 """
 
 import json
@@ -30,7 +30,7 @@ import hashlib
 from typing import Any
 
 from astrbot.api.star import Context, Star, register
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.provider import ProviderRequest
 import astrbot.api.message_components as Comp
 
@@ -62,7 +62,7 @@ ROLE_PREFIX_RE = re.compile(r"^\s*[（(]([^()（）]{1,40})[）)]\s*(.*?)\s*$")
     "sticker_master",
     "Anrrow",
     "AI 驱动表情包工具 - 让 AI 像真人一样主动发送表情包",
-    "1.7.1-persona-network-fix",
+    "1.7.2-history-safe",
 )
 class StickerMaster(Star):
     """
@@ -701,14 +701,17 @@ class StickerMaster(Star):
                     logger.info(f"[StickerMaster] 兜底跳过：未匹配到 meaning='{meaning}', role='{role}'")
                 return
 
-            image_comp = await self._image_component_from_url(url)
-            if image_comp is None:
+            local_path = await self._download_image_to_cache(url)
+            if not local_path:
                 logger.warning(f"[StickerMaster] 兜底表情包发送取消：图片源下载失败，matched={matched}, url={url}")
                 return
-            chain.append(image_comp)
+
+            # 不再把图片 append 到 LLM 回复链里，避免图片被写入历史导致 token 爆表。
+            # 延迟一点发送，保证文字回复先出去，表情包后出去。
+            asyncio.create_task(self._send_image_out_of_band(event, local_path, delay=0.8))
             self._touch_recent(self._tool_sent_event_keys, event_key)
             self._mark_session_sticker_sent(session_key)
-            logger.info(f"[StickerMaster] 智能兜底补发: role={role or '-'}, score={score}, '{meaning}' → '{matched}' → {url}")
+            logger.info(f"[StickerMaster] 智能兜底补发(平台侧发送): role={role or '-'}, score={score}, '{meaning}' → '{matched}' → {url}")
         except Exception as e:
             logger.error(f"[StickerMaster] 兜底补发表情包失败: {e}")
 
@@ -968,6 +971,26 @@ class StickerMaster(Star):
             except Exception:
                 return None
 
+    async def _send_image_out_of_band(self, event: AstrMessageEvent, local_path: str, delay: float = 0.0) -> bool:
+        """
+        将表情包作为“平台侧消息”单独发出去，不塞进本轮 LLM 返回结果。
+
+        重点：不要在 llm_tool 里 yield event.image_result(...)，也不要在
+        on_decorating_result 里把 Image 追加到 result.chain。那样图片/本地路径/
+        base64 可能被 AstrBot 记入对话历史，下一轮就会变成几十万 token。
+        """
+        if not local_path or not os.path.exists(local_path):
+            return False
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            chain = MessageChain().file_image(local_path)
+            await self.context.send_message(event.unified_msg_origin, chain)
+            return True
+        except Exception as e:
+            logger.error(f"[StickerMaster] 表情包平台侧发送失败: {e}")
+            return False
+
     # ═══════════════════════════════════════════════════════════
     # 自定义表情包写入
     # ═══════════════════════════════════════════════════════════
@@ -1132,15 +1155,19 @@ class StickerMaster(Star):
         local_path = await self._download_image_to_cache(url)
         if not local_path:
             logger.warning(f"[StickerMaster] 工具发送失败：图片源下载失败，matched={matched}, url={url}")
-            yield event.plain_result(f"⚠️ 表情包《{matched}》匹配到了，但图片源暂时无法下载，已跳过发送。")
-            return
+            return f"表情包《{matched}》匹配到了，但图片源暂时无法下载，已跳过发送。"
+
+        sent = await self._send_image_out_of_band(event, local_path, delay=0.0)
+        if not sent:
+            logger.warning(f"[StickerMaster] 工具发送失败：平台侧发送失败，matched={matched}, local_path={local_path}")
+            return f"表情包《{matched}》已匹配，但平台侧发送失败。"
 
         self._touch_recent(self._tool_sent_event_keys, self._event_key(event))
         self._mark_session_sticker_sent(session_key)
-        logger.info(f"[StickerMaster] 工具发送: role={role or '-'}, '{meaning}' → '{matched}' → {url} -> {local_path}")
+        logger.info(f"[StickerMaster] 工具发送(平台侧发送): role={role or '-'}, '{meaning}' → '{matched}' → {url} -> {local_path}")
 
-        yield event.image_result(local_path)
-        return
+        # 只把极短文本返回给 LLM，绝不返回 image_result，避免图片进入下一轮上下文。
+        return f"已发送表情包：{matched}"
 
     # ═══════════════════════════════════════════════════════════
     # 工具函数
