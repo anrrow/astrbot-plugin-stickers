@@ -2,4 +2,4 @@ name: sticker_master
 desc: AI驱动表情包工具 - 让AI像真人一样根据上下文主动发送表情包，基于LLM Tool Use实现
 version: 1.0.0
 author: Anrrow
-repo: https://github.com/anrrow/astrbot-plugin-sticker-master
+repo: https://github.com/anrrow/astrbot-plugin-stickers
