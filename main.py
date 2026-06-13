@@ -14,7 +14,7 @@ sticker_master — AstrBot 表情包 AI 工具插件
 8. 增加人格分组面板：每个角色一个折叠项，人格分组名 + URL 粘贴栏，便于区分谁是谁。
 
 作者：Anrrow
-版本：1.7.0-persona-pack
+版本：1.7.1-persona-network-fix
 """
 
 import json
@@ -25,12 +25,19 @@ import inspect
 import random
 import re
 import time
+import asyncio
+import hashlib
 from typing import Any
 
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 import astrbot.api.message_components as Comp
+
+try:
+    import aiohttp
+except Exception:  # pragma: no cover - AstrBot normally includes aiohttp
+    aiohttp = None
 
 # AstrBot 新版推荐 filter.llm_tool；旧版可能只有 astrbot.api.llm_tool，这里做兼容。
 try:
@@ -55,7 +62,7 @@ ROLE_PREFIX_RE = re.compile(r"^\s*[（(]([^()（）]{1,40})[）)]\s*(.*?)\s*$")
     "sticker_master",
     "Anrrow",
     "AI 驱动表情包工具 - 让 AI 像真人一样主动发送表情包",
-    "1.7.0-persona-pack",
+    "1.7.1-persona-network-fix",
 )
 class StickerMaster(Star):
     """
@@ -694,7 +701,11 @@ class StickerMaster(Star):
                     logger.info(f"[StickerMaster] 兜底跳过：未匹配到 meaning='{meaning}', role='{role}'")
                 return
 
-            chain.append(Comp.Image.fromURL(url))
+            image_comp = await self._image_component_from_url(url)
+            if image_comp is None:
+                logger.warning(f"[StickerMaster] 兜底表情包发送取消：图片源下载失败，matched={matched}, url={url}")
+                return
+            chain.append(image_comp)
             self._touch_recent(self._tool_sent_event_keys, event_key)
             self._mark_session_sticker_sent(session_key)
             logger.info(f"[StickerMaster] 智能兜底补发: role={role or '-'}, score={score}, '{meaning}' → '{matched}' → {url}")
@@ -874,6 +885,90 @@ class StickerMaster(Star):
         return ""
 
     # ═══════════════════════════════════════════════════════════
+    # 图片发送缓存：避免 aiocqhttp 发送 URL 图片时被 AstrBot 强制下载失败
+    # ═══════════════════════════════════════════════════════════
+
+    def _image_cache_dir(self) -> str:
+        path = os.path.join(self._stickers_dir(), ".cache")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _url_ext(self, url: str) -> str:
+        clean = (url or "").split("?", 1)[0].split("#", 1)[0].lower()
+        for ext in (".gif", ".png", ".webp", ".jpg", ".jpeg"):
+            if clean.endswith(ext):
+                return ext
+        return ".jpg"
+
+    def _cached_path_for_url(self, url: str) -> str:
+        h = hashlib.sha256((url or "").encode("utf-8")).hexdigest()[:24]
+        return os.path.join(self._image_cache_dir(), h + self._url_ext(url))
+
+    async def _download_image_to_cache(self, url: str, retries: int = 3) -> str | None:
+        """
+        先把网络图片下载到本地缓存，再交给 AstrBot 发送本地文件。
+        这样可以避开 aiocqhttp 适配器在发送阶段临时下载 URL，导致 ServerDisconnectedError 后整条工具消息失败。
+        """
+        url = (url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return url if os.path.exists(url) else None
+
+        path = self._cached_path_for_url(url)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+
+        if aiohttp is None:
+            logger.warning("[StickerMaster] aiohttp 不可用，无法下载表情包 URL 到缓存")
+            return None
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (StickerMaster/AstrBot)",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Connection": "close",
+        }
+        timeout = aiohttp.ClientTimeout(total=25, connect=10, sock_read=20)
+        last_err: Exception | None = None
+
+        for attempt in range(1, max(1, retries) + 1):
+            tmp = path + ".tmp"
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with session.get(url, allow_redirects=True) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"HTTP {resp.status}")
+                        data = await resp.read()
+                        if not data:
+                            raise RuntimeError("empty image body")
+                        with open(tmp, "wb") as f:
+                            f.write(data)
+                        os.replace(tmp, path)
+                        return path
+            except Exception as e:
+                last_err = e
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.6 * attempt)
+
+        logger.warning(f"[StickerMaster] 表情包下载失败，url={url}, err={last_err}")
+        return None
+
+    async def _image_component_from_url(self, url: str) -> Any | None:
+        local_path = await self._download_image_to_cache(url)
+        if not local_path:
+            return None
+        try:
+            return Comp.Image.fromFileSystem(local_path)
+        except Exception:
+            # 兼容极旧版本，没有 fromFileSystem 时退回 fromURL / 本地路径构造。
+            try:
+                return Comp.Image.fromURL(local_path)
+            except Exception:
+                return None
+
+    # ═══════════════════════════════════════════════════════════
     # 自定义表情包写入
     # ═══════════════════════════════════════════════════════════
 
@@ -1034,11 +1129,17 @@ class StickerMaster(Star):
             logger.info(f"[StickerMaster] 工具调用未匹配到表情包: role='{role}', meaning='{meaning}'，跳过发送")
             return
 
+        local_path = await self._download_image_to_cache(url)
+        if not local_path:
+            logger.warning(f"[StickerMaster] 工具发送失败：图片源下载失败，matched={matched}, url={url}")
+            yield event.plain_result(f"⚠️ 表情包《{matched}》匹配到了，但图片源暂时无法下载，已跳过发送。")
+            return
+
         self._touch_recent(self._tool_sent_event_keys, self._event_key(event))
         self._mark_session_sticker_sent(session_key)
-        logger.info(f"[StickerMaster] 工具发送: role={role or '-'}, '{meaning}' → '{matched}' → {url}")
+        logger.info(f"[StickerMaster] 工具发送: role={role or '-'}, '{meaning}' → '{matched}' → {url} -> {local_path}")
 
-        yield event.image_result(url)
+        yield event.image_result(local_path)
         return
 
     # ═══════════════════════════════════════════════════════════
@@ -1432,6 +1533,32 @@ class StickerMaster(Star):
         if not matched and self.role_sticker_map:
             lines.append("\n如果没匹配上：在插件配置的人格分组里，把『人格名/人格ID』写成 AstrBot WebUI 里的人格名称，或把实际候选填到『人格别名』里。")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("sticker_test_url")
+    async def cmd_test_url(self, event: AstrMessageEvent):
+        """测试某个 URL 或 meaning 是否能下载并发送。"""
+        msg = getattr(event, "message_str", "") or ""
+        body = self._strip_command(msg, "sticker_test_url").strip()
+        if not body:
+            yield event.plain_result("用法：/sticker_test_url URL 或 /sticker_test_url 表情含义")
+            return
+
+        if body.startswith(("http://", "https://")):
+            url = body
+            matched = body
+        else:
+            role = await self._resolve_current_role(event)
+            url, matched = self._match(body, role=role)
+            if not url:
+                yield event.plain_result(f"❌ 没匹配到：{body}")
+                return
+
+        local_path = await self._download_image_to_cache(url)
+        if not local_path:
+            yield event.plain_result(f"❌ 下载失败：{matched}\n{url}")
+            return
+        yield event.plain_result(f"✅ 下载成功，准备发送：{matched}\n缓存：{local_path}")
+        yield event.image_result(local_path)
 
     @filter.command("sticker_stats")
     async def cmd_stats(self, event: AstrMessageEvent):
